@@ -73,6 +73,11 @@ static inline bool dl_time_before(u64 a, u64 b)
 	return (s64)(a - b) < 0;
 }
 
+static inline bool dl_time_after(u64 a, u64 b)
+{
+	return (s64)(a - b) > 0;
+}
+
 /*
  * Tells if entity @a should preempt entity @b.
  */
@@ -149,7 +154,7 @@ extern struct mutex sched_domains_mutex;
 struct cfs_rq;
 struct rt_rq;
 
-extern struct list_head task_groups;
+static LIST_HEAD(task_groups);
 
 struct cfs_bandwidth {
 #ifdef CONFIG_CFS_BANDWIDTH
@@ -349,6 +354,21 @@ static inline int rt_bandwidth_enabled(void)
 struct rt_rq {
 	struct rt_prio_array active;
 	unsigned int rt_nr_running;
+
+#ifdef CONFIG_SCHEDSTATS
+	u64 exec_clock;
+
+	unsigned long nr_retry_push;
+	unsigned long nr_pushed_away;
+	unsigned long nr_pulled_here;
+
+	u64 enqueue_cycles, dequeue_cycles, set_cycles;
+	unsigned long nr_enqueue, nr_dequeue;
+	u64 push_cycles, push_find_cycles, pull_cycles;
+	unsigned long nr_push, nr_pull;
+	unsigned long nr_push_find, nr_set;
+#endif
+
 #if defined CONFIG_SMP || defined CONFIG_RT_GROUP_SCHED
 	struct {
 		int curr; /* highest queued rt task prio */
@@ -386,7 +406,18 @@ struct dl_rq {
 
 	unsigned long dl_nr_running;
 
+#ifdef CONFIG_SCHEDSTATS
 	u64 exec_clock;
+	unsigned long nr_retry_push;
+	unsigned long nr_pushed_away;
+	unsigned long nr_pulled_here;
+
+	u64 enqueue_cycles, dequeue_cycles, set_cycles_push, set_cycles_pull;
+	unsigned long nr_enqueue, nr_dequeue;
+	u64 push_cycles, push_find_cycles, pull_cycles, pull_find_cycles;
+	unsigned long nr_push, nr_pull;
+	unsigned long nr_push_find, nr_set_push, nr_pull_find, nr_set_pull;
+#endif
 
 #ifdef CONFIG_SMP
 	/*
@@ -445,7 +476,8 @@ struct root_domain {
 	cpumask_var_t dlo_mask;
 	atomic_t dlo_count;
 	struct dl_bw dl_bw;
-	struct cpudl cpudl;
+	struct cpudl push_cpudl;
+	struct cpudl pull_cpudl;
 
 	/*
 	 * The "RT overload" flag: it gets set if a CPU has more than
@@ -496,11 +528,7 @@ struct rq {
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	/* list of leaf cfs_rq on this cpu: */
 	struct list_head leaf_cfs_rq_list;
-#ifdef CONFIG_SMP
-	unsigned long h_load_throttle;
-#endif /* CONFIG_SMP */
-#endif /* CONFIG_FAIR_GROUP_SCHED */
-
+#endif
 #ifdef CONFIG_RT_GROUP_SCHED
 	struct list_head leaf_rt_rq_list;
 #endif
@@ -652,8 +680,6 @@ static inline struct sched_domain *highest_flag_domain(int cpu, int flag)
 DECLARE_PER_CPU(struct sched_domain *, sd_llc);
 DECLARE_PER_CPU(int, sd_llc_id);
 
-extern int group_balance_cpu(struct sched_group *sg);
-
 #endif /* CONFIG_SMP */
 
 #include "stats.h"
@@ -664,19 +690,22 @@ extern int group_balance_cpu(struct sched_group *sg);
 /*
  * Return the group to which this tasks belongs.
  *
- * We cannot use task_subsys_state() and friends because the cgroup
- * subsystem changes that value before the cgroup_subsys::attach() method
- * is called, therefore we cannot pin it and might observe the wrong value.
- *
- * The same is true for autogroup's p->signal->autogroup->tg, the autogroup
- * core changes this before calling sched_move_task().
- *
- * Instead we use a 'copy' which is updated from sched_move_task() while
- * holding both task_struct::pi_lock and rq::lock.
+ * We use task_subsys_state_check() and extend the RCU verification with
+ * pi->lock and rq->lock because cpu_cgroup_attach() holds those locks for each
+ * task it moves into the cgroup. Therefore by holding either of those locks,
+ * we pin the task to the current cgroup.
  */
 static inline struct task_group *task_group(struct task_struct *p)
 {
-	return p->sched_task_group;
+	struct task_group *tg;
+	struct cgroup_subsys_state *css;
+
+	css = task_subsys_state_check(p, cpu_cgroup_subsys_id,
+			lockdep_is_held(&p->pi_lock) ||
+			lockdep_is_held(&task_rq(p)->lock));
+	tg = container_of(css, struct task_group, css);
+
+	return autogroup_task_group(p, tg);
 }
 
 /* Change a task's cfs_rq and parent entity if it moves across CPUs/groups */
@@ -870,7 +899,11 @@ static inline void prepare_lock_switch(struct rq *rq, struct task_struct *next)
 	 */
 	next->on_cpu = 1;
 #endif
+#ifdef __ARCH_WANT_INTERRUPTS_ON_CTXSW
+	raw_spin_unlock_irq(&rq->lock);
+#else
 	raw_spin_unlock(&rq->lock);
+#endif
 }
 
 static inline void finish_lock_switch(struct rq *rq, struct task_struct *prev)
@@ -884,7 +917,9 @@ static inline void finish_lock_switch(struct rq *rq, struct task_struct *prev)
 	smp_wmb();
 	prev->on_cpu = 0;
 #endif
+#ifndef __ARCH_WANT_INTERRUPTS_ON_CTXSW
 	local_irq_enable();
+#endif
 }
 #endif /* __ARCH_WANT_UNLOCKED_CTXSW */
 
@@ -998,6 +1033,7 @@ extern void sched_init_granularity(void);
 extern void update_max_interval(void);
 extern void update_group_power(struct sched_domain *sd, int cpu);
 extern int update_runtime(struct notifier_block *nfb, unsigned long action, void *hcpu);
+extern void init_sched_dl_class(void);
 extern void init_sched_rt_class(void);
 extern void init_sched_fair_class(void);
 extern void init_sched_dl_class(void);
@@ -1026,9 +1062,6 @@ struct cpuacct {
 	struct kernel_cpustat __percpu *cpustat;
 };
 
-extern struct cgroup_subsys cpuacct_subsys;
-extern struct cpuacct root_cpuacct;
-
 /* return cpu accounting group corresponding to this container */
 static inline struct cpuacct *cgroup_ca(struct cgroup *cgrp)
 {
@@ -1053,16 +1086,6 @@ static inline struct cpuacct *parent_ca(struct cpuacct *ca)
 extern void cpuacct_charge(struct task_struct *tsk, u64 cputime);
 #else
 static inline void cpuacct_charge(struct task_struct *tsk, u64 cputime) {}
-#endif
-
-#ifdef CONFIG_PARAVIRT
-static inline u64 steal_ticks(u64 steal)
-{
-	if (unlikely(steal > NSEC_PER_SEC))
-		return div_u64(steal, TICK_NSEC);
-
-	return __iter_div_u64_rem(steal, TICK_NSEC, &steal);
-}
 #endif
 
 static inline void inc_nr_running(struct rq *rq)
@@ -1090,6 +1113,8 @@ static inline u64 sched_avg_period(void)
 {
 	return (u64)sysctl_sched_time_avg * NSEC_PER_MSEC / 2;
 }
+
+void calc_load_account_idle(struct rq *this_rq);
 
 #ifdef CONFIG_SCHED_HRTICK
 
@@ -1292,7 +1317,8 @@ extern void print_rt_stats(struct seq_file *m, int cpu);
 
 extern void init_cfs_rq(struct cfs_rq *cfs_rq);
 extern void init_rt_rq(struct rt_rq *rt_rq, struct rq *rq);
-extern void init_dl_rq(struct dl_rq *rt_rq, struct rq *rq);
+extern void init_dl_rq(struct dl_rq *dl_rq, struct rq *rq);
+extern void unthrottle_offline_cfs_rqs(struct rq *rq);
 
 extern void account_cfs_bandwidth_used(int enabled, int was_enabled);
 
@@ -1305,53 +1331,3 @@ enum rq_nohz_flag_bits {
 
 #define nohz_flags(cpu)	(&cpu_rq(cpu)->nohz_flags)
 #endif
-
-#ifdef CONFIG_IRQ_TIME_ACCOUNTING
-
-DECLARE_PER_CPU(u64, cpu_hardirq_time);
-DECLARE_PER_CPU(u64, cpu_softirq_time);
-
-#ifndef CONFIG_64BIT
-DECLARE_PER_CPU(seqcount_t, irq_time_seq);
-
-static inline void irq_time_write_begin(void)
-{
-	__this_cpu_inc(irq_time_seq.sequence);
-	smp_wmb();
-}
-
-static inline void irq_time_write_end(void)
-{
-	smp_wmb();
-	__this_cpu_inc(irq_time_seq.sequence);
-}
-
-static inline u64 irq_time_read(int cpu)
-{
-	u64 irq_time;
-	unsigned seq;
-
-	do {
-		seq = read_seqcount_begin(&per_cpu(irq_time_seq, cpu));
-		irq_time = per_cpu(cpu_softirq_time, cpu) +
-			   per_cpu(cpu_hardirq_time, cpu);
-	} while (read_seqcount_retry(&per_cpu(irq_time_seq, cpu), seq));
-
-	return irq_time;
-}
-#else /* CONFIG_64BIT */
-static inline void irq_time_write_begin(void)
-{
-}
-
-static inline void irq_time_write_end(void)
-{
-}
-
-static inline u64 irq_time_read(int cpu)
-{
-	return per_cpu(cpu_softirq_time, cpu) + per_cpu(cpu_hardirq_time, cpu);
-}
-#endif /* CONFIG_64BIT */
-#endif /* CONFIG_IRQ_TIME_ACCOUNTING */
-
